@@ -1,0 +1,20 @@
+# Build artifacts
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Compiled DLL (use GitHub Releases for binaries)
+version.dll
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+Debug/
+Release/
+x64/
+x86/
+
+# Logs (generated at runtime)
+mod_logs/

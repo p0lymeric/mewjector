@@ -1,0 +1,25 @@
+; version.def — Export definitions for the version.dll proxy
+;
+; Maps the real version.dll export names to our Proxy_ wrapper functions.
+; The linker uses this so the game sees the exact same export table it
+; expects from the real version.dll.
+
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA       = Proxy_GetFileVersionInfoA
+    GetFileVersionInfoByHandle = Proxy_GetFileVersionInfoByHandle
+    GetFileVersionInfoExA     = Proxy_GetFileVersionInfoExA
+    GetFileVersionInfoExW     = Proxy_GetFileVersionInfoExW
+    GetFileVersionInfoSizeA   = Proxy_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeExA = Proxy_GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = Proxy_GetFileVersionInfoSizeExW
+    GetFileVersionInfoSizeW   = Proxy_GetFileVersionInfoSizeW
+    GetFileVersionInfoW       = Proxy_GetFileVersionInfoW
+    VerFindFileA              = Proxy_VerFindFileA
+    VerFindFileW              = Proxy_VerFindFileW
+    VerInstallFileA           = Proxy_VerInstallFileA
+    VerInstallFileW           = Proxy_VerInstallFileW
+    VerLanguageNameA          = Proxy_VerLanguageNameA
+    VerLanguageNameW          = Proxy_VerLanguageNameW
+    VerQueryValueA            = Proxy_VerQueryValueA
+    VerQueryValueW            = Proxy_VerQueryValueW
