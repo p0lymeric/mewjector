@@ -1,6 +1,6 @@
 # Mewjector
 
-A DLL mod loader for [Mewgenics](https://store.steampowered.com/app/1985820/Mewgenics/). Drop it into your Mewgenics install directory and it automatically loads mod DLLs at startup.
+A DLL mod loader for [Mewgenics](https://store.steampowered.com/app/686060/Mewgenics/). Drop it into your Mewgenics install directory and it automatically loads mod DLLs at startup.
 
 Designed to work alongside [Mewtator](https://www.nexusmods.com/mewgenics/mods/1), the Mewgenics mod manager. When both are installed, they handshake automatically through `chainloader.ini`.
 
