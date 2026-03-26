@@ -87,12 +87,18 @@ static void CLog(const char* fmt, ...)
  *  INI configuration
  * =================================================================== */
 
+#define MAX_LOAD_ORDER 64
+
 typedef struct {
     int  enabled;            /* Master switch                            */
     int  logging;            /* Whether to log (already open by now)     */
     char scanPath[MAX_PATH]; /* Directory to scan for DLLs (relative)    */
     int  scanGameDir;        /* Also scan the exe's own directory        */
     char manifest[MAX_PATH]; /* Mewtator manifest path (abs or relative) */
+
+    /* [LoadOrder] — priority DLLs loaded first, in listed order */
+    char loadOrder[MAX_LOAD_ORDER][MAX_PATH];
+    int  loadOrderCount;
 } ChainloaderConfig;
 
 static ChainloaderConfig g_config;
@@ -118,9 +124,10 @@ static void LoadConfig(void)
     char buf[MAX_PATH];
 
     /* Defaults — these apply if no ini exists */
-    g_config.enabled     = 1;
-    g_config.logging     = 1;
-    g_config.scanGameDir = 0;
+    g_config.enabled        = 1;
+    g_config.logging        = 1;
+    g_config.scanGameDir    = 0;
+    g_config.loadOrderCount = 0;
     strcpy(g_config.scanPath, "mods");
     g_config.manifest[0] = '\0';
 
@@ -174,6 +181,28 @@ static void LoadConfig(void)
         CLog("  MewtatorManifest=%s", g_config.manifest);
     else
         CLog("  MewtatorManifest=(none)");
+
+    /* [LoadOrder] — numbered entries: Mod1=foo.dll, Mod2=bar.dll, ... */
+    g_config.loadOrderCount = 0;
+    for (int i = 1; i <= MAX_LOAD_ORDER; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "Mod%d", i);
+        GetPrivateProfileStringA("LoadOrder", key, "",
+                                 buf, sizeof(buf), iniPath);
+        TrimInPlace(buf);
+        if (buf[0] == '\0') break;  /* Stop at first missing entry */
+        strncpy(g_config.loadOrder[g_config.loadOrderCount], buf, MAX_PATH - 1);
+        g_config.loadOrder[g_config.loadOrderCount][MAX_PATH - 1] = '\0';
+        g_config.loadOrderCount++;
+    }
+
+    if (g_config.loadOrderCount > 0) {
+        CLog("  LoadOrder: %d entries", g_config.loadOrderCount);
+        for (int i = 0; i < g_config.loadOrderCount; i++)
+            CLog("    Mod%d=%s", i + 1, g_config.loadOrder[i]);
+    } else {
+        CLog("  LoadOrder: (none)");
+    }
 }
 
 /* ===================================================================
@@ -244,16 +273,134 @@ static int LoadRealVersionDll(void)
 }
 
 /* ===================================================================
+ *  Deferred mod loading — triggered on first proxy call
+ *
+ *  We cannot load mod DLLs inside DllMain because the Windows loader
+ *  lock is held, which prevents any threads those DLLs spawn from
+ *  starting.  Instead, we defer mod loading until the game makes its
+ *  first call to any version.dll export.  At that point the loader
+ *  lock is released, we're in normal execution context, and it's
+ *  early enough that hooks install before anything important runs.
+ * =================================================================== */
+
+/* Forward declarations for functions/data defined further below */
+static void ScanAndLoadDir(const char* dirPath, const char* label);
+static void LoadMewtatorManifest(const char* manifestPath);
+static int  AlreadyLoaded(const char* fullPath);
+static void RecordLoaded(const char* fullPath);
+static int  g_loadedCount;
+
+static volatile int g_modsLoaded = 0;
+
+static void LoadModsOnce(void)
+{
+    if (g_modsLoaded) return;
+    g_modsLoaded = 1;
+
+    CLog("First proxy call — loading mods (loader lock released)");
+    CLog("");
+
+    /* Phase 1: [LoadOrder] priority DLLs — loaded first, in listed order */
+    if (g_config.loadOrderCount > 0) {
+        CLog("[LoadOrder] Loading %d priority DLL(s)...", g_config.loadOrderCount);
+
+        /* Resolve the scan directory once for relative paths */
+        char modDir[MAX_PATH];
+        if (g_config.scanPath[0]) {
+            if (g_config.scanPath[0] != '\\' &&
+                !(g_config.scanPath[1] == ':')) {
+                snprintf(modDir, MAX_PATH, "%s%s", g_baseDir, g_config.scanPath);
+            } else {
+                strncpy(modDir, g_config.scanPath, MAX_PATH - 1);
+                modDir[MAX_PATH - 1] = '\0';
+            }
+        } else {
+            strncpy(modDir, g_baseDir, MAX_PATH - 1);
+            modDir[MAX_PATH - 1] = '\0';
+        }
+
+        for (int i = 0; i < g_config.loadOrderCount; i++) {
+            const char* entry = g_config.loadOrder[i];
+            char fullPath[MAX_PATH];
+
+            /* Absolute or relative path */
+            if (entry[0] == '\\' || (entry[1] == ':')) {
+                strncpy(fullPath, entry, MAX_PATH - 1);
+                fullPath[MAX_PATH - 1] = '\0';
+            } else {
+                snprintf(fullPath, MAX_PATH, "%s\\%s", modDir, entry);
+            }
+
+            if (AlreadyLoaded(fullPath)) {
+                CLog("[LoadOrder]   %d. SKIP (already loaded): %s", i + 1, entry);
+                continue;
+            }
+
+            CLog("[LoadOrder]   %d. Loading: %s", i + 1, entry);
+            HMODULE hMod = LoadLibraryA(fullPath);
+            if (hMod) {
+                CLog("[LoadOrder]      OK at 0x%p", (void*)hMod);
+                RecordLoaded(fullPath);
+            } else {
+                DWORD err = GetLastError();
+                CLog("[LoadOrder]      FAILED — error %lu (0x%08lX)", err, err);
+            }
+        }
+        CLog("");
+    }
+
+    /* Phase 2: Scan configured mod directory */
+    if (g_config.scanPath[0]) {
+        char scanDir[MAX_PATH];
+        if (g_config.scanPath[0] != '\\' &&
+            !(g_config.scanPath[1] == ':')) {
+            snprintf(scanDir, MAX_PATH, "%s%s", g_baseDir, g_config.scanPath);
+        } else {
+            strncpy(scanDir, g_config.scanPath, MAX_PATH - 1);
+            scanDir[MAX_PATH - 1] = '\0';
+        }
+        ScanAndLoadDir(scanDir, "ScanPath");
+        CLog("");
+    }
+
+    /* Phase 3: Optionally scan game exe directory */
+    if (g_config.scanGameDir) {
+        char gameDir[MAX_PATH];
+        strncpy(gameDir, g_baseDir, MAX_PATH - 1);
+        gameDir[MAX_PATH - 1] = '\0';
+        size_t gdLen = strlen(gameDir);
+        if (gdLen > 0 && gameDir[gdLen-1] == '\\')
+            gameDir[gdLen-1] = '\0';
+        ScanAndLoadDir(gameDir, "GameDir");
+        CLog("");
+    }
+
+    /* Phase 4: Mewtator manifest */
+    if (g_config.manifest[0]) {
+        LoadMewtatorManifest(g_config.manifest);
+        CLog("");
+    }
+
+    CLog("=== Chainloader init complete: %d DLL(s) loaded ===",
+         g_loadedCount);
+}
+
+
+/* ===================================================================
  *  Exported forwarding stubs
  *
  *  Each is a thin wrapper that tail-calls the real function.
  *  The .def file maps the real export names to these Proxy_ functions.
+ *  Every stub calls LoadModsOnce() to trigger deferred mod loading
+ *  on the first call.
  * =================================================================== */
 
 __declspec(dllexport) BOOL WINAPI Proxy_GetFileVersionInfoA(
     LPCSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData)
 {
     typedef BOOL (WINAPI *fn_t)(LPCSTR, DWORD, DWORD, LPVOID);
+    LoadModsOnce();
+    if (!pfn_GetFileVersionInfoA) return FALSE;
     return ((fn_t)pfn_GetFileVersionInfoA)(lptstrFilename, dwHandle, dwLen, lpData);
 }
 
@@ -261,6 +408,7 @@ __declspec(dllexport) int WINAPI Proxy_GetFileVersionInfoByHandle(
     int hMem, LPCWSTR lpFileName, HANDLE handle, LPVOID lpData, DWORD cbData)
 {
     typedef int (WINAPI *fn_t)(int, LPCWSTR, HANDLE, LPVOID, DWORD);
+    LoadModsOnce();
     if (!pfn_GetFileVersionInfoByHandle) return 0;
     return ((fn_t)pfn_GetFileVersionInfoByHandle)(hMem, lpFileName, handle, lpData, cbData);
 }
@@ -269,6 +417,7 @@ __declspec(dllexport) BOOL WINAPI Proxy_GetFileVersionInfoExA(
     DWORD dwFlags, LPCSTR lpwstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData)
 {
     typedef BOOL (WINAPI *fn_t)(DWORD, LPCSTR, DWORD, DWORD, LPVOID);
+    LoadModsOnce();
     if (!pfn_GetFileVersionInfoExA) return FALSE;
     return ((fn_t)pfn_GetFileVersionInfoExA)(dwFlags, lpwstrFilename, dwHandle, dwLen, lpData);
 }
@@ -277,6 +426,7 @@ __declspec(dllexport) BOOL WINAPI Proxy_GetFileVersionInfoExW(
     DWORD dwFlags, LPCWSTR lpwstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData)
 {
     typedef BOOL (WINAPI *fn_t)(DWORD, LPCWSTR, DWORD, DWORD, LPVOID);
+    LoadModsOnce();
     if (!pfn_GetFileVersionInfoExW) return FALSE;
     return ((fn_t)pfn_GetFileVersionInfoExW)(dwFlags, lpwstrFilename, dwHandle, dwLen, lpData);
 }
@@ -285,6 +435,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_GetFileVersionInfoSizeA(
     LPCSTR lptstrFilename, LPDWORD lpdwHandle)
 {
     typedef DWORD (WINAPI *fn_t)(LPCSTR, LPDWORD);
+    LoadModsOnce();
+    if (!pfn_GetFileVersionInfoSizeA) return 0;
     return ((fn_t)pfn_GetFileVersionInfoSizeA)(lptstrFilename, lpdwHandle);
 }
 
@@ -292,6 +444,7 @@ __declspec(dllexport) DWORD WINAPI Proxy_GetFileVersionInfoSizeExA(
     DWORD dwFlags, LPCSTR lpwstrFilename, LPDWORD lpdwHandle)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCSTR, LPDWORD);
+    LoadModsOnce();
     if (!pfn_GetFileVersionInfoSizeExA) return 0;
     return ((fn_t)pfn_GetFileVersionInfoSizeExA)(dwFlags, lpwstrFilename, lpdwHandle);
 }
@@ -300,6 +453,7 @@ __declspec(dllexport) DWORD WINAPI Proxy_GetFileVersionInfoSizeExW(
     DWORD dwFlags, LPCWSTR lpwstrFilename, LPDWORD lpdwHandle)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCWSTR, LPDWORD);
+    LoadModsOnce();
     if (!pfn_GetFileVersionInfoSizeExW) return 0;
     return ((fn_t)pfn_GetFileVersionInfoSizeExW)(dwFlags, lpwstrFilename, lpdwHandle);
 }
@@ -308,6 +462,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_GetFileVersionInfoSizeW(
     LPCWSTR lptstrFilename, LPDWORD lpdwHandle)
 {
     typedef DWORD (WINAPI *fn_t)(LPCWSTR, LPDWORD);
+    LoadModsOnce();
+    if (!pfn_GetFileVersionInfoSizeW) return 0;
     return ((fn_t)pfn_GetFileVersionInfoSizeW)(lptstrFilename, lpdwHandle);
 }
 
@@ -315,6 +471,8 @@ __declspec(dllexport) BOOL WINAPI Proxy_GetFileVersionInfoW(
     LPCWSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData)
 {
     typedef BOOL (WINAPI *fn_t)(LPCWSTR, DWORD, DWORD, LPVOID);
+    LoadModsOnce();
+    if (!pfn_GetFileVersionInfoW) return FALSE;
     return ((fn_t)pfn_GetFileVersionInfoW)(lptstrFilename, dwHandle, dwLen, lpData);
 }
 
@@ -323,6 +481,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_VerFindFileA(
     LPSTR szCurDir, PUINT puCurDirLen, LPSTR szDestDir, PUINT puDestDirLen)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT, LPSTR, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerFindFileA) return 0;
     return ((fn_t)pfn_VerFindFileA)(uFlags, szFileName, szWinDir, szAppDir,
                                      szCurDir, puCurDirLen, szDestDir, puDestDirLen);
 }
@@ -332,6 +492,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_VerFindFileW(
     LPWSTR szCurDir, PUINT puCurDirLen, LPWSTR szDestDir, PUINT puDestDirLen)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT, LPWSTR, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerFindFileW) return 0;
     return ((fn_t)pfn_VerFindFileW)(uFlags, szFileName, szWinDir, szAppDir,
                                      szCurDir, puCurDirLen, szDestDir, puDestDirLen);
 }
@@ -341,6 +503,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_VerInstallFileA(
     LPCSTR szDestDir, LPCSTR szCurDir, LPSTR szTmpFile, PUINT puTmpFileLen)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerInstallFileA) return 0;
     return ((fn_t)pfn_VerInstallFileA)(uFlags, szSrcFileName, szDestFileName, szSrcDir,
                                         szDestDir, szCurDir, szTmpFile, puTmpFileLen);
 }
@@ -350,6 +514,8 @@ __declspec(dllexport) DWORD WINAPI Proxy_VerInstallFileW(
     LPCWSTR szDestDir, LPCWSTR szCurDir, LPWSTR szTmpFile, PUINT puTmpFileLen)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerInstallFileW) return 0;
     return ((fn_t)pfn_VerInstallFileW)(uFlags, szSrcFileName, szDestFileName, szSrcDir,
                                         szDestDir, szCurDir, szTmpFile, puTmpFileLen);
 }
@@ -357,12 +523,16 @@ __declspec(dllexport) DWORD WINAPI Proxy_VerInstallFileW(
 __declspec(dllexport) DWORD WINAPI Proxy_VerLanguageNameA(DWORD wLang, LPSTR szLang, DWORD cchLang)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPSTR, DWORD);
+    LoadModsOnce();
+    if (!pfn_VerLanguageNameA) return 0;
     return ((fn_t)pfn_VerLanguageNameA)(wLang, szLang, cchLang);
 }
 
 __declspec(dllexport) DWORD WINAPI Proxy_VerLanguageNameW(DWORD wLang, LPWSTR szLang, DWORD cchLang)
 {
     typedef DWORD (WINAPI *fn_t)(DWORD, LPWSTR, DWORD);
+    LoadModsOnce();
+    if (!pfn_VerLanguageNameW) return 0;
     return ((fn_t)pfn_VerLanguageNameW)(wLang, szLang, cchLang);
 }
 
@@ -370,6 +540,8 @@ __declspec(dllexport) BOOL WINAPI Proxy_VerQueryValueA(
     LPCVOID pBlock, LPCSTR lpSubBlock, LPVOID* lplpBuffer, PUINT puLen)
 {
     typedef BOOL (WINAPI *fn_t)(LPCVOID, LPCSTR, LPVOID*, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerQueryValueA) return FALSE;
     return ((fn_t)pfn_VerQueryValueA)(pBlock, lpSubBlock, lplpBuffer, puLen);
 }
 
@@ -377,6 +549,8 @@ __declspec(dllexport) BOOL WINAPI Proxy_VerQueryValueW(
     LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID* lplpBuffer, PUINT puLen)
 {
     typedef BOOL (WINAPI *fn_t)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    LoadModsOnce();
+    if (!pfn_VerQueryValueW) return FALSE;
     return ((fn_t)pfn_VerQueryValueW)(pBlock, lpSubBlock, lplpBuffer, puLen);
 }
 
@@ -577,6 +751,11 @@ static void LoadMewtatorManifest(const char* manifestPath)
 
 /* ===================================================================
  *  DLL entry point
+ *
+ *  DllMain only handles lightweight setup that is safe under the
+ *  loader lock: base dir resolution, logging, version.dll forwarding,
+ *  and config parsing.  Actual mod loading is deferred to the first
+ *  proxy call via LoadModsOnce() — see above.
  * =================================================================== */
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
@@ -589,15 +768,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         ResolveBaseDir();
         LogOpen();
 
-        CLog("=== Chainloader v2.0 ===");
+        CLog("=== Chainloader v2.1 ===");
         CLog("Process: PID %lu", GetCurrentProcessId());
         CLog("Game directory: %s", g_baseDir);
         CLog("");
 
         if (!LoadRealVersionDll()) {
-            CLog("Cannot continue without real version.dll. Aborting mod load.");
-            LogClose();
-            return TRUE;
+            CLog("WARNING: Could not load real version.dll. Forwarded API calls");
+            CLog("  will return failures, but mod loading will proceed.");
         }
         CLog("");
 
@@ -610,42 +788,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
             return TRUE;
         }
 
-        /* Phase 1: Scan configured mod directory */
-        if (g_config.scanPath[0]) {
-            char scanDir[MAX_PATH];
-            /* Resolve relative paths against game directory */
-            if (g_config.scanPath[0] != '\\' &&
-                !(g_config.scanPath[1] == ':')) {
-                snprintf(scanDir, MAX_PATH, "%s%s", g_baseDir, g_config.scanPath);
-            } else {
-                strncpy(scanDir, g_config.scanPath, MAX_PATH - 1);
-                scanDir[MAX_PATH - 1] = '\0';
-            }
-            ScanAndLoadDir(scanDir, "ScanPath");
-            CLog("");
-        }
-
-        /* Phase 2: Optionally scan game exe directory */
-        if (g_config.scanGameDir) {
-            /* Strip trailing backslash for the scan */
-            char gameDir[MAX_PATH];
-            strncpy(gameDir, g_baseDir, MAX_PATH - 1);
-            gameDir[MAX_PATH - 1] = '\0';
-            size_t gdLen = strlen(gameDir);
-            if (gdLen > 0 && gameDir[gdLen-1] == '\\')
-                gameDir[gdLen-1] = '\0';
-            ScanAndLoadDir(gameDir, "GameDir");
-            CLog("");
-        }
-
-        /* Phase 3: Mewtator manifest */
-        if (g_config.manifest[0]) {
-            LoadMewtatorManifest(g_config.manifest);
-            CLog("");
-        }
-
-        CLog("=== Chainloader init complete: %d DLL(s) loaded ===",
-             g_loadedCount);
+        CLog("Mod loading deferred to first proxy call.");
+        CLog("");
     }
     else if (reason == DLL_PROCESS_DETACH) {
         CLog("=== Chainloader detaching ===");
