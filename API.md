@@ -317,4 +317,3 @@ names bypasses collision detection but otherwise works fine.
 | Owner string     | 63 chars  | Truncated                              |
 | Name string      | 127 chars | Truncated                              |
 | Category string  | 31 chars  | Truncated                              |
-                                                                                                                                                                                                                                                  
