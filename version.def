@@ -1,11 +1,15 @@
-; version.def — Export definitions for the version.dll proxy
+; version.def — Export definitions for the Mewjector version.dll proxy
 ;
 ; Maps the real version.dll export names to our Proxy_ wrapper functions.
 ; The linker uses this so the game sees the exact same export table it
 ; expects from the real version.dll.
+;
+; Mewjector API exports (MJ_*) are additional — mods resolve them via
+; GetProcAddress(GetModuleHandleA("version.dll"), "MJ_...").
 
 LIBRARY version
 EXPORTS
+    ; --- Original version.dll proxy exports (untouched) ---
     GetFileVersionInfoA       = Proxy_GetFileVersionInfoA
     GetFileVersionInfoByHandle = Proxy_GetFileVersionInfoByHandle
     GetFileVersionInfoExA     = Proxy_GetFileVersionInfoExA
@@ -23,3 +27,14 @@ EXPORTS
     VerLanguageNameW          = Proxy_VerLanguageNameW
     VerQueryValueA            = Proxy_VerQueryValueA
     VerQueryValueW            = Proxy_VerQueryValueW
+
+    ; --- Mewjector API v3 ---
+    MJ_InstallHook
+    MJ_QueryHook
+    MJ_AllocTypeIdPair
+    MJ_RegisterName
+    MJ_LookupName
+    MJ_GetGameBase
+    MJ_Log
+    MJ_VerifyHooks
+    MJ_GetVersion

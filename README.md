@@ -12,7 +12,26 @@ Mewjector acts as a DLL proxy for `version.dll`. When the game loads it, Mewject
 2. Reads `chainloader.ini` for configuration
 3. Scans configured directories for `.dll` mod files and loads them
 4. Optionally reads a [Mewtator](https://www.nexusmods.com/mewgenics/mods/1) manifest for managed mod loading
-5. Logs everything to `mod_logs/chainloader.log`
+5. Exports an opt-in [mod API](API.md) for hook chaining, type ID allocation, and namespace collision detection
+6. Logs everything to `mod_logs/chainloader.log`
+
+## Mod API
+
+Mewjector v3.0 exports functions that mods can resolve at runtime. The API is opt-in; mods that don't use it work exactly as before.
+
+| Export | Purpose |
+|--------|---------|
+| `MJ_InstallHook` | Chainable entry-point hook |
+| `MJ_QueryHook` | Hook count at an RVA |
+| `MJ_AllocTypeIdPair` | Unique type index pair |
+| `MJ_RegisterName` | Collision-detected name registration |
+| `MJ_LookupName` | Name ownership query |
+| `MJ_GetGameBase` | Game image base |
+| `MJ_Log` | Shared log output |
+| `MJ_VerifyHooks` | Hook integrity scan |
+| `MJ_GetVersion` | API version (3) |
+
+Include [`mewjector.h`](mewjector.h) for convenience wrappers, or resolve directly via `GetProcAddress`. See [API.md](API.md) for full documentation.
 
 ## Quick Start
 

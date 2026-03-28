@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Mewjector API version (used by LoadModsOnce and the API itself) */
+#define MJ_API_VERSION 3
+
+/* Forward declarations and early globals for MJ API
+ * (full API defined further below, but LoadModsOnce needs these) */
+__declspec(dllexport) int __cdecl MJ_VerifyHooks(void);
+static UINT_PTR g_mjGameBase    = 0;
+static int      g_mjHasHooks    = 0;  /* set by MJ_InstallHook, checked post-load */
+
 /* ===================================================================
  *  Game base directory (resolved once, used everywhere)
  * =================================================================== */
@@ -297,7 +306,13 @@ static void LoadModsOnce(void)
     if (g_modsLoaded) return;
     g_modsLoaded = 1;
 
+    /* Resolve game image base for RVA calculations */
+    g_mjGameBase = (UINT_PTR)GetModuleHandleA(NULL);
+
     CLog("First proxy call — loading mods (loader lock released)");
+    CLog("Game image base: 0x%p", (void*)g_mjGameBase);
+    CLog("Mewjector API v%d available (MJ_InstallHook, MJ_RegisterName, ...)",
+         MJ_API_VERSION);
     CLog("");
 
     /* Phase 1: [LoadOrder] priority DLLs — loaded first, in listed order */
@@ -381,8 +396,18 @@ static void LoadModsOnce(void)
         CLog("");
     }
 
-    CLog("=== Chainloader init complete: %d DLL(s) loaded ===",
+    CLog("=== Mod loading complete: %d DLL(s) loaded ===",
          g_loadedCount);
+
+    /* Post-load hook integrity verification */
+    if (g_mjHasHooks) {
+        CLog("");
+        CLog("[MJ] Running post-load integrity check...");
+        int corrupted = MJ_VerifyHooks();
+        if (corrupted > 0)
+            CLog("[MJ] WARNING: %d hook site(s) may have been "
+                 "overwritten by non-Mewjector mods!", corrupted);
+    }
 }
 
 
@@ -750,6 +775,524 @@ static void LoadMewtatorManifest(const char* manifestPath)
 }
 
 /* ===================================================================
+ *  Mewjector API v3: Exported services for mod coordination
+ *
+ *  Mods resolve these at runtime via:
+ *    HMODULE hMJ = GetModuleHandleA("version.dll");
+ *    fn = GetProcAddress(hMJ, "MJ_InstallHook");
+ *
+ *  Or include mewjector.h for convenience wrappers.
+ *
+ *  Services:
+ *    Hook chaining:   multiple mods can hook the same RVA safely
+ *    Type ID alloc:   unique custom type index pairs, no collisions
+ *    Name registry:   detect namespace collisions at init time
+ *    Integrity check: verify no third party overwrote managed hooks
+ *    Shared logging:  mods can log through the chainloader's log
+ * =================================================================== */
+
+/* MJ_API_VERSION is defined near the top of the file (forward decl block) */
+#define MJ_MAX_NAMES    512
+#define MJ_TYPE_ID_BASE 0x1000  /* Well above vanilla range (0–0x318) */
+
+/* --- Hook chaining structures --- */
+
+typedef struct MJ_HookEntry {
+    void*  hookFn;              /* Mod's replacement function               */
+    BYTE*  trampoline;          /* Executable JMP stub -> next hook/original*/
+    int    priority;            /* Lower = called first                     */
+    char   owner[64];           /* DLL name for diagnostics                 */
+    struct MJ_HookEntry* next;  /* Next in priority-sorted chain            */
+} MJ_HookEntry;
+
+typedef struct MJ_HookSite {
+    UINT_PTR         rva;            /* Game function RVA                   */
+    int              stolenBytes;    /* Bytes replaced at entry             */
+    BYTE*            patchAddr;      /* Absolute address of patched entry   */
+    BYTE*            origTrampoline; /* Stolen bytes + JMP back to original */
+    BYTE             origBytes[24];  /* Backup of original bytes (for verify) */
+    MJ_HookEntry*    chain;          /* Head of priority-sorted hook list   */
+    struct MJ_HookSite* nextSite;    /* Next in global site list            */
+} MJ_HookSite;
+
+/* --- Namespace registry --- */
+
+typedef struct {
+    char category[32];   /* e.g. "status", "formula_var", "conditional" */
+    char name[128];      /* e.g. "ModRegen", "inbreeding"              */
+    char owner[64];      /* e.g. "CustomStatusFramework"               */
+} MJ_NameEntry;
+
+/* --- Mewjector API globals --- */
+/* g_mjGameBase is defined early (line ~30) so LoadModsOnce can use it */
+
+static MJ_HookSite*  g_mjHookSites  = NULL;
+static HANDLE        g_mjHookMutex  = NULL;
+
+static MJ_NameEntry  g_mjNames[MJ_MAX_NAMES];
+static int           g_mjNameCount  = 0;
+static HANDLE        g_mjNameMutex  = NULL;
+
+static volatile LONG g_mjNextTypeId = MJ_TYPE_ID_BASE;
+
+/* --- Internal: find existing hook site by RVA --- */
+
+static MJ_HookSite* MJ_FindSite(UINT_PTR rva)
+{
+    for (MJ_HookSite* s = g_mjHookSites; s; s = s->nextSite)
+        if (s->rva == rva) return s;
+    return NULL;
+}
+
+/* --- Internal: allocate a 14-byte executable JMP stub --- */
+
+static BYTE* MJ_AllocJmpStub(void* target)
+{
+    BYTE* stub = (BYTE*)VirtualAlloc(NULL, 14,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub) return NULL;
+
+    /*  FF 25 00 00 00 00   jmp qword ptr [rip+0]
+     *  XX XX XX XX XX XX XX XX   absolute target address   */
+    stub[0] = 0xFF;
+    stub[1] = 0x25;
+    stub[2] = 0x00;
+    stub[3] = 0x00;
+    stub[4] = 0x00;
+    stub[5] = 0x00;
+    memcpy(stub + 6, &target, 8);
+    return stub;
+}
+
+/* --- Internal: update a JMP stub's target (RWX memory, no protect needed) --- */
+
+static void MJ_UpdateStub(BYTE* stub, void* newTarget)
+{
+    memcpy(stub + 6, &newTarget, 8);
+}
+
+/* --- Internal: create a new hook site and patch the game entry --- */
+
+static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
+{
+    MJ_HookSite* site = (MJ_HookSite*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MJ_HookSite));
+    if (!site) return NULL;
+
+    site->rva         = rva;
+    site->stolenBytes = stolenBytes;
+    site->patchAddr   = (BYTE*)(g_mjGameBase + rva);
+    site->chain       = NULL;
+
+    /* Back up original bytes for integrity verification */
+    memcpy(site->origBytes, site->patchAddr,
+           stolenBytes < 24 ? stolenBytes : 24);
+
+    /* Build original trampoline: stolen bytes + JMP back to original+N */
+    int tramSz = stolenBytes + 14;
+    BYTE* tramp = (BYTE*)VirtualAlloc(NULL, tramSz,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) {
+        HeapFree(GetProcessHeap(), 0, site);
+        return NULL;
+    }
+
+    memcpy(tramp, site->patchAddr, stolenBytes);   /* stolen prologue  */
+    tramp[stolenBytes + 0] = 0xFF;                 /* jmp qword [rip+0]*/
+    tramp[stolenBytes + 1] = 0x25;
+    tramp[stolenBytes + 2] = 0x00;
+    tramp[stolenBytes + 3] = 0x00;
+    tramp[stolenBytes + 4] = 0x00;
+    tramp[stolenBytes + 5] = 0x00;
+    UINT_PTR retAddr = (UINT_PTR)site->patchAddr + stolenBytes;
+    memcpy(tramp + stolenBytes + 6, &retAddr, 8);  /* return address   */
+
+    site->origTrampoline = tramp;
+
+    /* Patch the game entry point:
+     *   FF 25 00 00 00 00 [8-byte target]  = 14 bytes
+     *   Remaining stolen bytes filled with 0x90 (NOP), unreachable   */
+    DWORD oldProt;
+    VirtualProtect(site->patchAddr, stolenBytes,
+                   PAGE_EXECUTE_READWRITE, &oldProt);
+
+    site->patchAddr[0] = 0xFF;
+    site->patchAddr[1] = 0x25;
+    site->patchAddr[2] = 0x00;
+    site->patchAddr[3] = 0x00;
+    site->patchAddr[4] = 0x00;
+    site->patchAddr[5] = 0x00;
+    /* Target address at [6..13], filled by RebuildChain */
+    memset(site->patchAddr + 6, 0, 8);
+    for (int i = 14; i < stolenBytes; i++)
+        site->patchAddr[i] = 0x90;
+
+    VirtualProtect(site->patchAddr, stolenBytes, oldProt, &oldProt);
+
+    /* Prepend to global site list */
+    site->nextSite = g_mjHookSites;
+    g_mjHookSites  = site;
+
+    return site;
+}
+
+/* --- Internal: rebuild the hook chain for a site ---
+ *
+ *  Game entry -> chain[0].hookFn
+ *  chain[0].trampoline -> chain[1].hookFn
+ *  chain[1].trampoline -> chain[2].hookFn
+ *  ...
+ *  chain[N].trampoline -> origTrampoline (real game code)            */
+
+static void MJ_RebuildChain(MJ_HookSite* site)
+{
+    if (!site->chain) return;
+
+    /* Update the 8-byte target in the patched game entry */
+    DWORD oldProt;
+    VirtualProtect(site->patchAddr + 6, 8,
+                   PAGE_EXECUTE_READWRITE, &oldProt);
+    memcpy(site->patchAddr + 6, &site->chain->hookFn, 8);
+    VirtualProtect(site->patchAddr + 6, 8, oldProt, &oldProt);
+
+    /* Wire each hook's trampoline to the next hook (or original) */
+    for (MJ_HookEntry* e = site->chain; e; e = e->next) {
+        void* target = e->next
+            ? e->next->hookFn
+            : (void*)site->origTrampoline;
+        MJ_UpdateStub(e->trampoline, target);
+    }
+}
+
+/* ===================================================================
+ *  MJ_InstallHook: Install a chainable hook at a game RVA
+ *
+ *  Multiple hooks on the same RVA are chained by priority
+ *  (lower priority value = called first in the chain).
+ *
+ *  outTrampoline receives a callable function pointer with the
+ *  same signature as the hooked function.  Calling it invokes
+ *  the next hook in the chain, or the original game function
+ *  if this is the last (lowest-priority) hook.
+ *
+ *  Returns 1 on success, 0 on failure.
+ * =================================================================== */
+
+__declspec(dllexport) int __cdecl MJ_InstallHook(
+    UINT_PTR    rva,
+    int         stolenBytes,
+    void*       hookFn,
+    void**      outTrampoline,
+    int         priority,
+    const char* owner)
+{
+    if (!hookFn || !outTrampoline || stolenBytes < 14) {
+        CLog("[MJ] InstallHook REJECTED: bad args "
+             "(rva=0x%llX stolen=%d hook=%p owner=%s)",
+             (unsigned long long)rva, stolenBytes, hookFn,
+             owner ? owner : "(null)");
+        return 0;
+    }
+
+    /* Lazy init game base (should already be set by LoadModsOnce) */
+    if (!g_mjGameBase)
+        g_mjGameBase = (UINT_PTR)GetModuleHandleA(NULL);
+
+    WaitForSingleObject(g_mjHookMutex, INFINITE);
+
+    /* Find or create the hook site */
+    MJ_HookSite* site = MJ_FindSite(rva);
+
+    if (!site) {
+        site = MJ_CreateSite(rva, stolenBytes);
+        if (!site) {
+            CLog("[MJ] InstallHook FAILED: could not create site "
+                 "for RVA 0x%llX (%s)",
+                 (unsigned long long)rva, owner ? owner : "?");
+            ReleaseMutex(g_mjHookMutex);
+            return 0;
+        }
+        CLog("[MJ] New hook site: RVA 0x%llX (%d stolen bytes)",
+             (unsigned long long)rva, stolenBytes);
+    } else if (site->stolenBytes != stolenBytes) {
+        CLog("[MJ] WARNING: %s requests %d stolen bytes at "
+             "RVA 0x%llX but site already has %d, using %d",
+             owner ? owner : "?", stolenBytes,
+             (unsigned long long)rva, site->stolenBytes,
+             site->stolenBytes);
+    }
+
+    /* Allocate the hook entry */
+    MJ_HookEntry* entry = (MJ_HookEntry*)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MJ_HookEntry));
+    if (!entry) {
+        CLog("[MJ] InstallHook FAILED: entry alloc (%s)",
+             owner ? owner : "?");
+        ReleaseMutex(g_mjHookMutex);
+        return 0;
+    }
+
+    entry->hookFn    = hookFn;
+    entry->priority  = priority;
+    entry->trampoline = MJ_AllocJmpStub(NULL);  /* target set by rebuild */
+    if (owner) { strncpy(entry->owner, owner, 63); entry->owner[63] = '\0'; }
+
+    if (!entry->trampoline) {
+        CLog("[MJ] InstallHook FAILED: trampoline alloc (%s)",
+             owner ? owner : "?");
+        HeapFree(GetProcessHeap(), 0, entry);
+        ReleaseMutex(g_mjHookMutex);
+        return 0;
+    }
+
+    /* Insert into chain sorted by priority (lower = earlier) */
+    MJ_HookEntry** pp = &site->chain;
+    while (*pp && (*pp)->priority <= priority)
+        pp = &(*pp)->next;
+    entry->next = *pp;
+    *pp = entry;
+
+    /* Rebuild the entire chain for this site */
+    MJ_RebuildChain(site);
+
+    *outTrampoline = (void*)entry->trampoline;
+    g_mjHasHooks = 1;
+
+    CLog("[MJ] Hook installed: RVA 0x%llX  pri=%d  owner=%s  fn=%p",
+         (unsigned long long)rva, priority,
+         owner ? owner : "?", hookFn);
+
+    /* Log the full chain state */
+    int pos = 0;
+    for (MJ_HookEntry* e = site->chain; e; e = e->next, pos++) {
+        void* nextTarget = e->next
+            ? e->next->hookFn
+            : (void*)site->origTrampoline;
+        CLog("[MJ]   chain[%d]: %-24s pri=%-4d fn=%p -> %p",
+             pos, e->owner, e->priority, e->hookFn, nextTarget);
+    }
+
+    ReleaseMutex(g_mjHookMutex);
+    return 1;
+}
+
+/* ===================================================================
+ *  MJ_QueryHook: Count hooks installed at an RVA
+ * =================================================================== */
+
+__declspec(dllexport) int __cdecl MJ_QueryHook(UINT_PTR rva)
+{
+    WaitForSingleObject(g_mjHookMutex, INFINITE);
+    int count = 0;
+    MJ_HookSite* site = MJ_FindSite(rva);
+    if (site)
+        for (MJ_HookEntry* e = site->chain; e; e = e->next)
+            count++;
+    ReleaseMutex(g_mjHookMutex);
+    return count;
+}
+
+/* ===================================================================
+ *  MJ_AllocTypeIdPair: Allocate a unique type ID pair
+ *
+ *  Returns base index.  Caller gets base and base+1.
+ *  Thread-safe via InterlockedExchangeAdd.
+ * =================================================================== */
+
+__declspec(dllexport) UINT_PTR __cdecl MJ_AllocTypeIdPair(const char* owner)
+{
+    LONG base = InterlockedExchangeAdd(&g_mjNextTypeId, 2);
+    CLog("[MJ] TypeIdPair: 0x%04X / 0x%04X  owner=%s",
+         (unsigned)base, (unsigned)(base + 1),
+         owner ? owner : "?");
+    return (UINT_PTR)base;
+}
+
+/* ===================================================================
+ *  MJ_RegisterName: Register a name in a collision namespace
+ *
+ *  Categories: "status", "formula_var", "conditional", "x_is",
+ *  or any string your mods agree on.
+ *
+ *  Returns 1 if registered.  Returns 0 if the name was already
+ *  taken by a different owner (collision detected).
+ * =================================================================== */
+
+__declspec(dllexport) int __cdecl MJ_RegisterName(
+    const char* category,
+    const char* name,
+    const char* owner)
+{
+    if (!category || !name) return 0;
+
+    WaitForSingleObject(g_mjNameMutex, INFINITE);
+
+    /* Check for collision */
+    for (int i = 0; i < g_mjNameCount; i++) {
+        if (_stricmp(g_mjNames[i].category, category) == 0 &&
+            _stricmp(g_mjNames[i].name, name) == 0)
+        {
+            /* Same owner re-registering is OK (idempotent) */
+            if (owner && _stricmp(g_mjNames[i].owner, owner) == 0) {
+                ReleaseMutex(g_mjNameMutex);
+                return 1;
+            }
+            CLog("[MJ] NAME COLLISION: %s/%s owned by [%s], "
+                 "rejected for [%s]",
+                 category, name, g_mjNames[i].owner,
+                 owner ? owner : "?");
+            ReleaseMutex(g_mjNameMutex);
+            return 0;
+        }
+    }
+
+    if (g_mjNameCount >= MJ_MAX_NAMES) {
+        CLog("[MJ] Name registry full (%d)! Cannot register %s/%s",
+             MJ_MAX_NAMES, category, name);
+        ReleaseMutex(g_mjNameMutex);
+        return 0;
+    }
+
+    MJ_NameEntry* e = &g_mjNames[g_mjNameCount++];
+    strncpy(e->category, category, 31);          e->category[31] = '\0';
+    strncpy(e->name, name, 127);                 e->name[127]    = '\0';
+    strncpy(e->owner, owner ? owner : "", 63);   e->owner[63]    = '\0';
+
+    CLog("[MJ] Name registered: %s/%s  owner=%s", category, name, e->owner);
+
+    ReleaseMutex(g_mjNameMutex);
+    return 1;
+}
+
+/* ===================================================================
+ *  MJ_LookupName: Check who owns a name (or NULL if unregistered)
+ * =================================================================== */
+
+__declspec(dllexport) const char* __cdecl MJ_LookupName(
+    const char* category,
+    const char* name)
+{
+    if (!category || !name) return NULL;
+
+    WaitForSingleObject(g_mjNameMutex, INFINITE);
+    for (int i = 0; i < g_mjNameCount; i++) {
+        if (_stricmp(g_mjNames[i].category, category) == 0 &&
+            _stricmp(g_mjNames[i].name, name) == 0)
+        {
+            const char* result = g_mjNames[i].owner;
+            ReleaseMutex(g_mjNameMutex);
+            return result;
+        }
+    }
+    ReleaseMutex(g_mjNameMutex);
+    return NULL;
+}
+
+/* ===================================================================
+ *  MJ_GetGameBase: Return the game's image base address
+ * =================================================================== */
+
+__declspec(dllexport) UINT_PTR __cdecl MJ_GetGameBase(void)
+{
+    if (!g_mjGameBase)
+        g_mjGameBase = (UINT_PTR)GetModuleHandleA(NULL);
+    return g_mjGameBase;
+}
+
+/* ===================================================================
+ *  MJ_Log: Log through the chainloader's timestamped log file
+ *
+ *  Mods can use this instead of opening their own log files.
+ *  Output goes to mod_logs/chainloader.log with an [owner] tag.
+ * =================================================================== */
+
+__declspec(dllexport) void __cdecl MJ_Log(
+    const char* owner,
+    const char* fmt, ...)
+{
+    if (!g_logFile) return;
+    WaitForSingleObject(g_logMutex, INFINITE);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_logFile, "[%02d:%02d:%02d.%03d] [%s] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            owner ? owner : "?");
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_logFile, fmt, ap);
+    va_end(ap);
+
+    fprintf(g_logFile, "\n");
+    fflush(g_logFile);
+
+    ReleaseMutex(g_logMutex);
+}
+
+/* ===================================================================
+ *  MJ_VerifyHooks: Post-load integrity check
+ *
+ *  Reads each managed hook site's entry bytes and verifies they
+ *  still contain our FF 25 patch pointing at the chain head.
+ *  Call after all mods are loaded to detect third-party overwrites.
+ *
+ *  Returns the number of corrupted sites (0 = all good).
+ * =================================================================== */
+
+__declspec(dllexport) int __cdecl MJ_VerifyHooks(void)
+{
+    int corrupted = 0;
+
+    WaitForSingleObject(g_mjHookMutex, INFINITE);
+
+    for (MJ_HookSite* site = g_mjHookSites; site; site = site->nextSite) {
+        /* Check the entry still has our FF 25 opcode */
+        if (site->patchAddr[0] != 0xFF || site->patchAddr[1] != 0x25) {
+            CLog("[MJ] INTEGRITY FAIL: RVA 0x%llX entry overwritten! "
+                 "Expected FF 25, found %02X %02X",
+                 (unsigned long long)site->rva,
+                 site->patchAddr[0], site->patchAddr[1]);
+            corrupted++;
+            continue;
+        }
+
+        /* Check the target matches the current chain head */
+        if (site->chain) {
+            void* currentTarget;
+            memcpy(&currentTarget, site->patchAddr + 6, 8);
+            if (currentTarget != site->chain->hookFn) {
+                CLog("[MJ] INTEGRITY FAIL: RVA 0x%llX target mismatch! "
+                     "Expected %p (%s), found %p",
+                     (unsigned long long)site->rva,
+                     site->chain->hookFn, site->chain->owner,
+                     currentTarget);
+                corrupted++;
+            }
+        }
+    }
+
+    ReleaseMutex(g_mjHookMutex);
+
+    if (corrupted == 0 && g_mjHookSites)
+        CLog("[MJ] Integrity check: ALL OK");
+    else if (corrupted > 0)
+        CLog("[MJ] Integrity check: %d site(s) CORRUPTED!", corrupted);
+
+    return corrupted;
+}
+
+/* ===================================================================
+ *  MJ_GetVersion: Return API version for compatibility checks
+ * =================================================================== */
+
+__declspec(dllexport) int __cdecl MJ_GetVersion(void)
+{
+    return MJ_API_VERSION;
+}
+
+
+/* ===================================================================
  *  DLL entry point
  *
  *  DllMain only handles lightweight setup that is safe under the
@@ -768,7 +1311,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         ResolveBaseDir();
         LogOpen();
 
-        CLog("=== Chainloader v2.1 ===");
+        /* Init Mewjector API mutexes (safe under loader lock) */
+        g_mjHookMutex = CreateMutexA(NULL, FALSE, NULL);
+        g_mjNameMutex = CreateMutexA(NULL, FALSE, NULL);
+
+        CLog("=== Mewjector v3.0 ===");
         CLog("Process: PID %lu", GetCurrentProcessId());
         CLog("Game directory: %s", g_baseDir);
         CLog("");
@@ -792,7 +1339,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         CLog("");
     }
     else if (reason == DLL_PROCESS_DETACH) {
-        CLog("=== Chainloader detaching ===");
+        CLog("=== Mewjector detaching ===");
+
+        if (g_mjHookMutex) { CloseHandle(g_mjHookMutex); g_mjHookMutex = NULL; }
+        if (g_mjNameMutex) { CloseHandle(g_mjNameMutex); g_mjNameMutex = NULL; }
+
         LogClose();
 
         if (g_realVersionDll) {
