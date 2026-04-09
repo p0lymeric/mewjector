@@ -20,7 +20,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
-#include "detours.h"
+#include "mj_lde.h"
 
 /* Mewjector API version (used by LoadModsOnce and the API itself) */
 #define MJ_API_VERSION 3
@@ -882,16 +882,29 @@ static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
 
     BYTE* patchAddr = (BYTE*)(g_mjGameBase + rva);
 
-    /* If stolenBytes == 0, we calculate the stolen byte amount ourselves */
+    /* If stolenBytes == 0, calculate the stolen byte count ourselves using
+     * mj_lde (see mj_lde.h). mj_lde returns 0 on any opcode it does not
+     * recognize, in which case we abort and require the caller to supply
+     * an explicit stolenBytes value for this hook site. */
     if (stolenBytes == 0)
     {
-        /* Measure the number of bytes to steal using an instruction walker */
-        BYTE* endOfStolenRegion = patchAddr;
-        while(endOfStolenRegion - patchAddr < 14)
+        BYTE* cursor = patchAddr;
+        while (cursor - patchAddr < 14)
         {
-            endOfStolenRegion = DetourCopyInstruction(NULL, NULL, endOfStolenRegion, NULL, NULL);
+            int len = mj_lde(cursor);
+            if (len <= 0)
+            {
+                CLog("[Mewjector] MJ_CreateSite: mj_lde failed to decode "
+                     "instruction at rva=0x%llX (offset %lld). Caller must "
+                     "supply explicit stolenBytes for this site.\n",
+                     (unsigned long long)rva,
+                     (long long)(cursor - patchAddr));
+                HeapFree(GetProcessHeap(), 0, site);
+                return NULL;
+            }
+            cursor += len;
         }
-        stolenBytes = endOfStolenRegion - patchAddr;
+        stolenBytes = (int)(cursor - patchAddr);
     }
 
     site->rva         = rva;
