@@ -152,7 +152,7 @@ typedef struct {
  *  separate .c file or import lib needed.
  * =================================================================== */
 
-static int MJ_Resolve(MewjectorAPI* api)
+static inline int MJ_Resolve(MewjectorAPI* api)
 {
     if (!api) return 0;
     memset(api, 0, sizeof(MewjectorAPI));

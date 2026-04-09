@@ -82,7 +82,7 @@ Subsequent hooks on the same RVA:
 ```c
 int __cdecl MJ_InstallHook(
     UINT_PTR    rva,            // target function RVA
-    int         stolenBytes,    // bytes to steal, >= 14
+    int         stolenBytes,    // bytes to steal, 0 to auto-calculate; >= 14 for manual
     void*       hookFn,         // same signature as original
     void**      outTrampoline,  // receives call-next function pointer
     int         priority,       // lower = called first
@@ -92,10 +92,11 @@ int __cdecl MJ_InstallHook(
 
 Returns 1/0. Failure is logged.
 
-`stolenBytes` must land on an instruction boundary. Caller ensures no RIP-relative
-instructions in the stolen range (they get relocated to a different address in the
-trampoline). First hook establishes the count; subsequent hooks for the same RVA
-warn if they disagree but use the established value.
+`stolenBytes` must land on an instruction boundary. Pass 0 to calculate automatically,
+or pass a manually calculated value. Caller ensures no RIP-relative instructions in
+the stolen range (they get relocated to a different address in the trampoline). First
+hook establishes the count; subsequent hooks for the same RVA warn if they disagree but
+use the established value.
 
 `outTrampoline` stays valid for process lifetime. Cast it to the original fn type.
 

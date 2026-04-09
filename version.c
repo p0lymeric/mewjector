@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "detours.h"
 
 /* Mewjector API version (used by LoadModsOnce and the API itself) */
 #define MJ_API_VERSION 3
@@ -879,9 +880,23 @@ static MJ_HookSite* MJ_CreateSite(UINT_PTR rva, int stolenBytes)
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MJ_HookSite));
     if (!site) return NULL;
 
+    BYTE* patchAddr = (BYTE*)(g_mjGameBase + rva);
+
+    /* If stolenBytes == 0, we calculate the stolen byte amount ourselves */
+    if (stolenBytes == 0)
+    {
+        /* Measure the number of bytes to steal using an instruction walker */
+        BYTE* endOfStolenRegion = patchAddr;
+        while(endOfStolenRegion - patchAddr < 14)
+        {
+            endOfStolenRegion = DetourCopyInstruction(NULL, NULL, endOfStolenRegion, NULL, NULL);
+        }
+        stolenBytes = endOfStolenRegion - patchAddr;
+    }
+
     site->rva         = rva;
     site->stolenBytes = stolenBytes;
-    site->patchAddr   = (BYTE*)(g_mjGameBase + rva);
+    site->patchAddr   = patchAddr;
     site->chain       = NULL;
 
     /* Back up original bytes for integrity verification */
@@ -986,7 +1001,7 @@ __declspec(dllexport) int __cdecl MJ_InstallHook(
     int         priority,
     const char* owner)
 {
-    if (!hookFn || !outTrampoline || stolenBytes < 14) {
+    if (!hookFn || !outTrampoline || (stolenBytes < 14 && stolenBytes != 0)) {
         CLog("[MJ] InstallHook REJECTED: bad args "
              "(rva=0x%llX stolen=%d hook=%p owner=%s)",
              (unsigned long long)rva, stolenBytes, hookFn,
@@ -1013,8 +1028,11 @@ __declspec(dllexport) int __cdecl MJ_InstallHook(
             return 0;
         }
         CLog("[MJ] New hook site: RVA 0x%llX (%d stolen bytes)",
-             (unsigned long long)rva, stolenBytes);
-    } else if (site->stolenBytes != stolenBytes) {
+             (unsigned long long)rva, site->stolenBytes);
+    } else if (stolenBytes != 0 && site->stolenBytes != stolenBytes) {
+        /* Note that if the site has already been created with a manual stolenBytes value,
+         * subsequent hooking attempts with stolenBytes==0 do not check whether the
+         * established size agrees with an automatic calculation */
         CLog("[MJ] WARNING: %s requests %d stolen bytes at "
              "RVA 0x%llX but site already has %d, using %d",
              owner ? owner : "?", stolenBytes,

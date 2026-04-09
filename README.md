@@ -76,7 +76,10 @@ Logging=1
 Requires MSVC (Visual Studio Build Tools or full Visual Studio).
 
 ```
-cl /LD /O2 /GS- version.c /Fe:version.dll /link /DEF:version.def
+git submodule update --init --recursive
+cl /c /O2 /GS- /I third_party\Detours\src third_party\Detours\src\disasm.cpp third_party\Detours\src\modules.cpp third_party\Detours\src\detours.cpp
+lib /out:Detours.lib disasm.obj modules.obj detours.obj
+cl /LD /O2 /GS- /I third_party\Detours\src version.c Detours.lib /Fe:version.dll /link /DEF:version.def
 ```
 
 This produces `version.dll` along with intermediate build artifacts (`.obj`, `.lib`, `.exp`) which can be discarded.
@@ -108,3 +111,8 @@ DLL mods installed through Mewtator are loaded alongside any loose DLLs you've p
 ## License
 
 [MIT](LICENSE)
+
+## Attribution
+
+Mewjector uses [Detours](https://github.com/microsoft/Detours) to implement part of its function hook API.
+> Copyright (c) Microsoft Corporation. All rights reserved. Licensed under the [MIT](https://github.com/microsoft/Detours/blob/main/LICENSE.md) License.
