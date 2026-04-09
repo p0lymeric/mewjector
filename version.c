@@ -307,6 +307,9 @@ static void LoadModsOnce(void)
     if (g_modsLoaded) return;
     g_modsLoaded = 1;
 
+    /* Actually disable when Enabled=0 says we're disabled. */
+    if (!g_config.enabled) return;
+
     /* Resolve game image base for RVA calculations */
     g_mjGameBase = (UINT_PTR)GetModuleHandleA(NULL);
 
